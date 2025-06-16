@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
+from torch.nn.utils.rnn import pad_sequence
+
 
 
 func = partial(zscore) 
@@ -45,6 +47,86 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)  
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+
+def get_text_and_brain(file_path, df, tmax=2.0, pre_audio=2.0, pre_stimulus=2.0,
+                          model=None, tokenizer=None, ecog_sr_down=32,
+                          device=None, download_text=False, base_path=None, layer='last'):
+    
+    model = model.to(device)
+
+    raw = mne.io.read_raw_fif(file_path, verbose=False)
+    raw.load_data()
+    raw = raw.apply_function(func, channel_wise=True, verbose=False)
+
+    # events = np.zeros((len(df), 3), dtype=int)
+    # events[:, 0] = (df.start * raw.info['sfreq']).astype(int)
+    df.dropna(subset=['start'], inplace=True)
+    df.sort_values("start", inplace=True)
+    events = np.zeros((len(df), 3))
+    events[:, 0] = df.start
+
+    epochs = mne.Epochs(
+        raw,
+        (events * raw.info['sfreq']).astype(int),
+        tmin=-pre_stimulus,
+        tmax=tmax,
+        baseline=None,
+        proj=False,
+        event_id=None,
+        preload=True,
+        event_repeated="merge",
+        verbose=False
+    )
+    good_idx = epochs.selection
+    print(f"Epochs object has a shape of: {epochs._data.shape}")
+    epochs = epochs.resample(sfreq=ecog_sr_down, npad='auto', method='fft', window='hamming')
+    epochs_snippet = epochs._data
+    print(f"Epochs object after down-sampling has a shape of: {epochs_snippet.shape}")
+
+    attention_mask_list = []
+    if download_text:
+        text_decoder_embd = []
+
+        for row_idx in tqdm.tqdm(good_idx):
+            
+            row = df.iloc[row_idx]
+            word_list = df[
+                (df["start"] >= row["start"] - pre_audio) & 
+                (df["start"] <= row["start"])
+            ]
+            words_in_segment = word_list["word"].tolist()
+            transcription = " ".join(words_in_segment)
+
+            with torch.no_grad():    
+                # -------- GPT
+                inputs = tokenizer(
+                    transcription, 
+                    return_tensors="pt"
+                )
+                input_ids = inputs["input_ids"].to(device)
+                attention_mask = inputs["attention_mask"].to(device)
+                outputs = model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+                last_hidden_dec = outputs.hidden_states[-1]
+                last_hidden_dec = last_hidden_dec.squeeze(0)
+                attention_mask = attention_mask.squeeze(0)
+                text_decoder_embd.append(last_hidden_dec.cpu())
+                attention_mask_list.append(attention_mask.cpu())
+        
+        text_decoder_embd = pad_sequence(text_decoder_embd, batch_first=True, padding_side='left')   
+        # text_decoder_embd = torch.stack(text_decoder_embd, dim=0) 
+        attention_mask_list = pad_sequence(attention_mask_list, batch_first=True, padding_side='left')  
+        # torch.save(text_decoder_embd, f"{base_path}/matteoc/podcast/text_2_2_sec_last.pt")
+
+    else:
+        text_decoder_embd = torch.load(f"{base_path}/matteoc/podcast/text_2_2_sec_{layer}.pt")
+        text_decoder_embd = text_decoder_embd[good_idx]
+
+    print(f"Text snippets after processing have a shape of: {text_decoder_embd.shape}")
+
+    return epochs_snippet, text_decoder_embd, attention_mask_list
+
 
 
 def get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df, events, 

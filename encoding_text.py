@@ -10,10 +10,9 @@ from mne_bids import BIDSPath
 from functools import partial
 from nilearn.plotting import plot_markers
 import torch
-from scipy.stats import pearsonr
 import torchaudio
-from transformers import WhisperProcessor, WhisperModel, AutoFeatureExtractor, AutoProcessor, WhisperForConditionalGeneration, WhisperTokenizer
-from utils import preprocess_raw_audio, get_stimuli_and_brain, set_seed, contrastive_loss
+from transformers import GPT2TokenizerFast, GPT2Model, AutoTokenizer, AutoModelForCausalLM
+from utils import preprocess_raw_audio, get_text_and_brain, set_seed, contrastive_loss
 from models import AttentiveStim2BrainNet, PositionalEncoding, LearnableTau, SoftMappingGRUSeq, Audio2BrainCNN
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
@@ -23,14 +22,15 @@ from torch import nn, optim
 import os
 
 
-# Inizializzazione dei modelli e del dispositivo (fuori dal ciclo per evitare ricaricamenti)
-model_w = WhisperModel.from_pretrained("openai/whisper-base")
-feature_extractor = AutoFeatureExtractor.from_pretrained("openai/whisper-base")
-tokenizer_w = WhisperTokenizer.from_pretrained("openai/whisper-base")
-processor_w = AutoProcessor.from_pretrained("openai/whisper-base")
-model_w.eval()
 
-device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+# Inizializzazione dei modelli e del dispositivo (fuori dal ciclo per evitare ricaricamenti)
+model_name = "gpt2"
+tokenizer_gpt = AutoTokenizer.from_pretrained(model_name)
+tokenizer_gpt.pad_token = tokenizer_gpt.eos_token
+model_gpt = AutoModelForCausalLM.from_pretrained(model_name)
+model_gpt.eval()
+
+device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
 base_path = "/srv/nfs-data/sisko"
 bids_root = base_path + "/storage/ECoG_podcast/ds005574-1.0.2"
 
@@ -56,7 +56,7 @@ events[:, 0] = df.start
 # Loop sui 9 soggetti
 # Assumiamo che i soggetti siano numerati da '01' a '09'.
 subjects = [f"{i:02d}" for i in range(1, 10)]
-layers = ['first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'new']
+layers = ['last']
 
 for layer in layers:
     print(f"\n{'='*50}")
@@ -76,15 +76,13 @@ for layer in layers:
                             suffix="ieeg",
                             extension="fif")
 
-        brain_data, audio_data = get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df,
-                                                            events, tmax=tmax, model=model_w,
-                                                            processor=processor_w, pre_stimulus=pre_stimulus,
-                                                            pre_audio=pre_audio, ecog_sr_down=ecog_sr_down,
-                                                            device=device, download_audio=False, base_path=base_path, layer=layer)
+        brain_data, text_data, _ = get_text_and_brain(file_path, df, tmax=2.0, pre_audio=2.0, pre_stimulus=2.0,
+                                                    model=model_gpt, tokenizer=tokenizer_gpt, ecog_sr_down=32,
+                                                    device=device, download_text=False, base_path=base_path, layer=layer)
 
         brain_timep = brain_data.shape[-1]
         brain_channels = brain_data.shape[1]
-        audio_timep = audio_data.shape[1]
+        text_timep = text_data.shape[1]
 
         outer_cv = KFold(n_splits=4, shuffle=False)
         all_corrs, all_attn, all_pvals = [], [], []
@@ -100,8 +98,8 @@ for layer in layers:
             brain_train = torch.tensor(brain_train, dtype=torch.float32).reshape(-1, brain_channels, brain_timep)
             brain_test = torch.tensor(brain_test, dtype=torch.float32).reshape(-1, brain_channels, brain_timep)
 
-            stimuli_train = audio_data[train_idx]
-            stimuli_test = audio_data[test_idx]
+            stimuli_train = text_data[train_idx]
+            stimuli_test = text_data[test_idx]
 
             train_dataset = TensorDataset(stimuli_train.to(device), brain_train.to(device))
             test_dataset = TensorDataset(stimuli_test.to(device), brain_test.to(device))
@@ -110,8 +108,8 @@ for layer in layers:
             test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
             set_seed(42)
-            model = SoftMappingGRUSeq(input_dim=512, hidden_dim=128, time_out=brain_timep, output_channels=brain_channels).to(device)
-            # model = Audio2BrainCNN(input_time=audio_timep, output_time=brain_timep, output_channels=brain_channels).to(device)
+            model = AttentiveStim2BrainNet(input_dim=768, d_model=256, nhead=2, num_layers=2, time_in=text_timep, time_out=brain_timep,
+                                           output_channels=brain_channels).to(device)
             tau_module = LearnableTau(init_tau=0.03).to(device)
             mse_loss = nn.MSELoss()
             mse_perc = 0.0
@@ -121,7 +119,7 @@ for layer in layers:
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5)
 
             best_loss = float('inf')
-            for epoch in range(50):
+            for epoch in range(35):
                 model.train()
                 total_loss = 0
                 for x, y in train_loader:
@@ -191,7 +189,7 @@ for layer in layers:
         coords *= 1000  # nilearn likes to plot in meters, not mm
         print(f"Coordinate matrix shape for subject {subject}: {coords.shape}")
 
-        to_save_path = f"{base_path}/matteoc/podcast/subj_data/sub_{subject}_soft"
+        to_save_path = f"{base_path}/matteoc/podcast/subj_data/sub_{subject}_text"
         os.makedirs(to_save_path, exist_ok=True)
         np.save(f"{to_save_path}/att_layer_{layer}.npy", all_attn)
         np.save(f"{to_save_path}/pval_layer_{layer}.npy", all_pvals)
