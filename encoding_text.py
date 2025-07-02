@@ -56,7 +56,7 @@ events[:, 0] = df.start
 # Loop sui 9 soggetti
 # Assumiamo che i soggetti siano numerati da '01' a '09'.
 subjects = [f"{i:02d}" for i in range(1, 10)]
-layers = ['last']
+layers = ['six', 'seven', 'eight', 'nine', 'ten', 'eleven']
 
 for layer in layers:
     print(f"\n{'='*50}")
@@ -191,7 +191,7 @@ for layer in layers:
 
         to_save_path = f"{base_path}/matteoc/podcast/subj_data/sub_{subject}_text"
         os.makedirs(to_save_path, exist_ok=True)
-        np.save(f"{to_save_path}/att_layer_{layer}.npy", all_attn)
+        # np.save(f"{to_save_path}/att_layer_{layer}.npy", all_attn)
         np.save(f"{to_save_path}/pval_layer_{layer}.npy", all_pvals)
         np.save(f"{to_save_path}/corr_layer_{layer}.npy", all_corrs)
         np.save(f"{to_save_path}/coords_ch.npy", coords)
