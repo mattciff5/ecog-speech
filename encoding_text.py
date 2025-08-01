@@ -20,6 +20,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 from torch import nn, optim
 import os
+from statsmodels.stats.multitest import fdrcorrection
 
 
 
@@ -30,7 +31,7 @@ tokenizer_gpt.pad_token = tokenizer_gpt.eos_token
 model_gpt = AutoModelForCausalLM.from_pretrained(model_name)
 model_gpt.eval()
 
-device = torch.device("cuda:6" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 base_path = "/srv/nfs-data/sisko"
 bids_root = base_path + "/storage/ECoG_podcast/ds005574-1.0.2"
 
@@ -41,6 +42,7 @@ whisper_sr = 16000
 tmax = 2.0
 pre_stimulus = 2.0
 pre_audio = 0.2
+n_permutations = 500
 
 audio_path = f"{bids_root}/stimuli/podcast.wav"
 audio_sf, audio_wave = wavfile.read(audio_path)
@@ -53,10 +55,17 @@ df.sort_values("start", inplace=True)
 events = np.zeros((len(df), 3))
 events[:, 0] = df.start
 
+def batch_pearson_corr(x, y):
+    """ x, y: tensors of shape (n_samples, n_features) """
+    x_centered = x - x.mean(dim=1, keepdim=True)
+    y_centered = y - y.mean(dim=1, keepdim=True)
+    numerator = (x_centered * y_centered).sum(dim=1)
+    denominator = torch.sqrt((x_centered**2).sum(dim=1) * (y_centered**2).sum(dim=1))
+    return numerator / (denominator + 1e-8)  # aggiunta eps per stabilità numerica
+
 # Loop sui 9 soggetti
-# Assumiamo che i soggetti siano numerati da '01' a '09'.
 subjects = [f"{i:02d}" for i in range(1, 10)]
-layers = ['six', 'seven', 'eight', 'nine', 'ten', 'eleven']
+layers = ['second', 'third', 'four', 'fifth', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'last']
 
 for layer in layers:
     print(f"\n{'='*50}")
@@ -108,7 +117,7 @@ for layer in layers:
             test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
             set_seed(42)
-            model = AttentiveStim2BrainNet(input_dim=768, d_model=256, nhead=2, num_layers=2, time_in=text_timep, time_out=brain_timep,
+            model = AttentiveStim2BrainNet(input_dim=768, d_model=256, nhead=4, num_layers=2, time_in=text_timep, time_out=brain_timep,
                                            output_channels=brain_channels).to(device)
             tau_module = LearnableTau(init_tau=0.03).to(device)
             mse_loss = nn.MSELoss()
@@ -148,9 +157,9 @@ for layer in layers:
                 if val_loss < best_loss:
                     best_loss = val_loss
                     # Salva il modello specifico per il soggetto e il fold
-                    torch.save(model.state_dict(), f"/home/matteoc/ecog-speech/best_model_fold{fold_idx+1}.pt")
+                    torch.save(model.state_dict(), f"/home/matteoc/ecog-speech/best_text_fold{fold_idx+1}.pt")
 
-            model.load_state_dict(torch.load(f"/home/matteoc/ecog-speech/best_model_fold{fold_idx+1}.pt"))
+            model.load_state_dict(torch.load(f"/home/matteoc/ecog-speech/best_text_fold{fold_idx+1}.pt"))
             model.eval()
             preds, targets, attn_values = [], [], []
             with torch.no_grad():
@@ -180,6 +189,33 @@ for layer in layers:
         all_attn = np.concatenate(all_attn, axis=0)
         print(f"\nFinal mean correlation across folds for subject {subject}: {np.nanmean(all_corrs):.4f}")
 
+        n_samples, n_channels, n_timepoints = preds.shape
+        null_distribution_tp = np.zeros((n_permutations, n_timepoints))
+        null_distribution_ch = np.zeros((n_permutations, n_channels))
+
+        for perm in tqdm.tqdm(range(n_permutations), desc="Permutation runs"):
+            shuffled_idx = np.random.permutation(n_samples)
+            y_true_perm = targets[shuffled_idx]
+
+            for tp in range(n_timepoints):
+                pred_tp = torch.tensor(preds[:, :, tp]).to(device)  # (samples, voxels)
+                true_tp = torch.tensor(y_true_perm[:, :, tp]).to(device)  
+                corrs = batch_pearson_corr(pred_tp, true_tp)  # (samples,)
+                null_distribution_tp[perm, tp] = corrs.mean().item()
+
+            for ch in range(n_channels):
+                pred_ch = torch.tensor(preds[:, ch, :]).to(device)  
+                true_ch = torch.tensor(y_true_perm[:, ch, :]).to(device)  
+                corrs_ch = batch_pearson_corr(pred_ch, true_ch)  
+                null_distribution_ch[perm, ch] = corrs_ch.mean().item()
+        
+        real_corr_tp = all_corrs.mean((0,1))
+        real_corr_ch = all_corrs.mean((0,2))
+        p_values_tp = np.mean(null_distribution_tp >= real_corr_tp[None, :], axis=0)  
+        p_values_ch = np.mean(null_distribution_ch >= real_corr_ch[None, :], axis=0)  
+        significant_tp, pvals_corrected_tp = fdrcorrection(p_values_tp, alpha=0.02)
+        significant_ch, pvals_corrected_ch = fdrcorrection(p_values_ch, alpha=0.01)
+
         raw = mne.io.read_raw_fif(file_path, verbose=False)
         raw.load_data(verbose=False)
         raw = raw.apply_function(func, channel_wise=False, verbose=False)
@@ -191,9 +227,12 @@ for layer in layers:
 
         to_save_path = f"{base_path}/matteoc/podcast/subj_data/sub_{subject}_text"
         os.makedirs(to_save_path, exist_ok=True)
-        # np.save(f"{to_save_path}/att_layer_{layer}.npy", all_attn)
-        np.save(f"{to_save_path}/pval_layer_{layer}.npy", all_pvals)
+        if layer == 'last':
+            np.save(f"{to_save_path}/att_layer_{layer}.npy", all_attn)
+        # np.save(f"{to_save_path}/pval_layer_{layer}.npy", all_pvals)
         np.save(f"{to_save_path}/corr_layer_{layer}.npy", all_corrs)
         np.save(f"{to_save_path}/coords_ch.npy", coords)
+        np.save(f"{to_save_path}/significant_tp.npy", significant_tp)
+        np.save(f"{to_save_path}/significant_ch.npy", significant_ch)
 
     print("\nProcesso completato per tutti i soggetti.")

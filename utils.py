@@ -130,7 +130,7 @@ def get_text_and_brain(file_path, df, tmax=2.0, pre_audio=2.0, pre_stimulus=2.0,
 
 
 def get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df, events, 
-                          tmax=2.0, pre_audio=2.0, pre_stimulus=2.0,
+                          tmax=2.0, post_audio=2.0, pre_audio=2.0, pre_stimulus=2.0,
                           model=None, processor=None, whisper_sr=16000,
                           device=None, ecog_sr_down=32, download_audio=False, 
                           base_path=None, layer='new'):
@@ -170,10 +170,10 @@ def get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df, events,
         for idx, row in tqdm.tqdm(enumerate(good_idx)):
             row = df.iloc[idx]
             start_sample = int((row['start']) * audio_sf) 
-            end_sample = start_sample + int(tmax * audio_sf)
+            end_sample = start_sample + int(post_audio * audio_sf)
             snippet = audio_wave_clean[start_sample - int(pre_audio * audio_sf):end_sample]
-            if len(snippet) < int(tmax * audio_sf):
-                padding_len = int(tmax * audio_sf) - len(snippet)
+            if len(snippet) < int(post_audio * audio_sf):
+                padding_len = int(post_audio * audio_sf) - len(snippet)
                 snippet = np.pad(snippet, (0, padding_len), mode='constant')
             snippet = torchaudio.transforms.Resample(audio_sf, whisper_sr)(torch.tensor(snippet).float())
             inputs = processor(snippet.squeeze(0), sampling_rate=whisper_sr, return_tensors="pt")
@@ -183,13 +183,13 @@ def get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df, events,
                 # WHISPER ENCODER
                 outputs = model.encoder(input_features=input_features, output_hidden_states=True)
                 all_hidden_states = outputs.hidden_states
-                first_layer = all_hidden_states[0][:,:int(50*(tmax+pre_audio))]
-                second_layer = all_hidden_states[1][:,:int(50*(tmax+pre_audio))]
-                third_layer = all_hidden_states[2][:,:int(50*(tmax+pre_audio))]
-                fourth_layer = all_hidden_states[3][:,:int(50*(tmax+pre_audio))]
-                fifth_layer = all_hidden_states[4][:,:int(50*(tmax+pre_audio))]
-                sixth_layer = all_hidden_states[5][:,:int(50*(tmax+pre_audio))]
-                last_hidden_layer = outputs.last_hidden_state[:,:int(50*(tmax+pre_audio))]
+                first_layer = all_hidden_states[0][:,:int(50*(post_audio+pre_audio))]
+                second_layer = all_hidden_states[1][:,:int(50*(post_audio+pre_audio))]
+                third_layer = all_hidden_states[2][:,:int(50*(post_audio+pre_audio))]
+                fourth_layer = all_hidden_states[3][:,:int(50*(post_audio+pre_audio))]
+                fifth_layer = all_hidden_states[4][:,:int(50*(post_audio+pre_audio))]
+                sixth_layer = all_hidden_states[5][:,:int(50*(post_audio+pre_audio))]
+                last_hidden_layer = outputs.last_hidden_state[:,:int(50*(post_audio+pre_audio))]
                 # hidden_states = hidden_states[:,::2]   # sort of downsampling
 
                 audio_snip_whisper.append(last_hidden_layer.squeeze(0).cpu())
@@ -208,17 +208,48 @@ def get_stimuli_and_brain(file_path, audio_wave_clean, audio_sf, df, events,
         fifth_layer_whisper = torch.stack(fifth_layer_whisper, dim=0)
         sixth_layer_whisper = torch.stack(sixth_layer_whisper, dim=0)
 
-        torch.save(first_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_first.pt")
-        torch.save(second_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_second.pt")
-        torch.save(third_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_third.pt")
-        torch.save(fourth_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_fourth.pt")
-        torch.save(fifth_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_fifth.pt")
-        torch.save(sixth_layer_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_sixth.pt")
-        torch.save(audio_snip_whisper, f"{base_path}/matteoc/podcast/audio_2_2_sec_new.pt")
-
     else:
         audio_snip_whisper = torch.load(f"{base_path}/matteoc/podcast/audio_2_2_sec_{layer}.pt")
 
     print(f"Audio snippets after processing have a shape of: {audio_snip_whisper.shape}")
 
     return epochs_snippet, audio_snip_whisper
+
+
+
+def get_stimuli_and_feature(file_path, df, events, embedd_file, tmax=2.0, post_audio=2.0, pre_audio=2.0, pre_stimulus=2.0,
+                          ecog_sr_down=32, download_audio=False, baseline_flag=False):
+
+    raw = mne.io.read_raw_fif(file_path, verbose=False)
+    raw.load_data()
+    raw = raw.apply_function(func, channel_wise=True, verbose=False)
+
+    epochs = mne.Epochs(
+        raw,
+        (events * raw.info['sfreq']).astype(int),
+        tmin=-pre_stimulus,
+        tmax=tmax,
+        baseline=None,
+        proj=False,
+        event_id=None,
+        preload=True,
+        event_repeated="merge",
+        verbose=False
+    )
+    good_idx = epochs.selection
+    print(f"Epochs object has a shape of: {epochs._data.shape}")
+    epochs = epochs.resample(sfreq=ecog_sr_down, npad='auto', method='fft', window='hamming')
+    epochs_snippet = epochs._data
+    print(f"Epochs object after down-sampling has a shape of: {epochs_snippet.shape}")
+    layer_embedding = None
+
+    if download_audio:
+        layer_embedding = embedd_file[:, 100-int(pre_audio*50): 100+int(post_audio*50), :]
+        if baseline_flag:
+            layer_embedding = layer_embedding.mean(dim=1)
+    else:
+        layer_embedding = embedd_file[good_idx]
+
+    print(f"Audio snippets after processing have a shape of: {layer_embedding.shape}")
+
+    return epochs_snippet, layer_embedding

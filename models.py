@@ -38,7 +38,8 @@ class PositionalEncoding(nn.Module):
         self.pe = pe.unsqueeze(0)
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)].to(x.device)
+        return x + self.pe[:, :x.size(1)].to(x.device) 
+    
 
 class AttentiveStim2BrainNet(nn.Module):
     def __init__(self, input_dim=512, output_channels=235, time_in=250, time_out=282, d_model=256, nhead=2, num_layers=2):
@@ -48,7 +49,6 @@ class AttentiveStim2BrainNet(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         # self.norm = nn.LayerNorm(d_model)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
         self.temporal_upsample = nn.Upsample(size=time_out, mode='linear', align_corners=True)
 
         self.mh_attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
@@ -56,7 +56,7 @@ class AttentiveStim2BrainNet(nn.Module):
 
     def forward(self, x):   # x: (batch, time_in, input_dim=512)
         x = self.input_proj(x)                           # (batch, time_in, d_model)
-        x = self.pos_enc(x)                             
+        x = self.pos_enc(x)                            
         x_encoded = self.encoder(x)                             
         x_target = self.temporal_upsample(x_encoded.permute(0, 2, 1)).permute(0, 2, 1)   # (batch, time_out, d_model)
         x_attn, attn_weights = self.mh_attention(query=x_target, key=x_encoded, value=x_encoded)  # (batch, time_out, d_model)    
