@@ -28,6 +28,7 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import fdrcorrection
+from statsmodels.stats.multitest import multipletests
 
 
 device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
@@ -55,6 +56,54 @@ df.sort_values("start", inplace=True)
 events = np.zeros((len(df), 3))
 events[:, 0] = df.start
 
+def calculate_pvalues(
+    observed: np.ndarray,
+    null_distribution: np.ndarray,
+    alternative: str = "two-sided",
+    adjustment: int = 1,
+) -> np.ndarray:
+    """Calculate p-value
+    See https://github.com/scipy/scipy/blob/v1.10.1/scipy/stats/_resampling.py#L1133-L1602
+    """
+    n_resamples = len(null_distribution)
+
+    # relative tolerance for detecting numerically distinct but
+    # theoretically equal values in the null distribution
+    eps = 1e-14
+    gamma = np.maximum(eps, np.abs(eps * observed))
+
+    def less(null_distribution, observed):
+        cmps = null_distribution <= observed + gamma
+        pvalues = (cmps.sum(axis=1) + adjustment) / (n_resamples + adjustment)
+        return pvalues
+
+    def greater(null_distribution, observed):
+        cmps = null_distribution >= observed - gamma
+        pvalues = (cmps.sum(axis=1) + adjustment) / (n_resamples + adjustment)
+        return pvalues
+
+    def two_sided(null_distribution, observed):
+        pvalues_less = less(null_distribution, observed)
+        pvalues_greater = greater(null_distribution, observed)
+        pvalues = np.minimum(pvalues_less, pvalues_greater) * 2
+        return pvalues
+
+    compare = {"less": less, "greater": greater, "two-sided": two_sided}
+
+    pvalues = compare[alternative](null_distribution, observed)
+    pvalues = np.clip(pvalues, 0, 1)
+
+    return pvalues
+
+def generate_null_dist(n_perms: int = 10000, dim_size: int = 2384, seed: int = None):
+    rng = np.random.default_rng(seed=seed)
+    null_dist = np.zeros(n_perms)
+    for i in range(n_perms):
+        a = rng.normal(size=dim_size)
+        b = rng.normal(size=dim_size)
+        null_dist[i] = np.corrcoef(a, b)[0, 1]
+    return null_dist
+
 def batch_pearson_corr(x, y):
     """ x, y: tensors of shape (n_samples, n_features) """
     x_centered = x - x.mean(dim=1, keepdim=True)
@@ -79,8 +128,8 @@ def train_encoding(X, Y):
 
         model.fit(X1_train, Y_train) # Fit pipeline with transforms and ridge estimator
         Y_preds = model.predict(X1_test) # Predict on test set and reshape to epochs shape
+        
         Y_preds = Y_preds.reshape(-1, epochs_shape[0], epochs_shape[1])
-
         corrs = np.zeros((epochs_shape[0], epochs_shape[1]))
         for ch in tqdm.tqdm(range(epochs_shape[0])):
             for t in range(epochs_shape[1]):
@@ -89,6 +138,7 @@ def train_encoding(X, Y):
         all_corrs.append(corrs)
         
         # corr = correlation_score(Y_test, Y_preds).reshape(epochs_shape) # Compute correlation score
+        # Y_preds = Y_preds.reshape(-1, epochs_shape[0], epochs_shape[1])
         # if "torch" in get_backend().__name__: # if using gpu, transform tensor back to numpy
         #     corr = corr.numpy(force=True)
         # all_corrs.append(corr) # append fold correlation results to final results
@@ -97,8 +147,10 @@ def train_encoding(X, Y):
 
 # Loop sui 9 soggetti
 subjects = [f"{i:02d}" for i in range(1, 10)]
-layers = ['audio', 'text']
+layers = ['audio', 'audio_last']
 embeddin_matrix = None
+download_audio = False
+baseline_flag = False
 
 alphas = np.logspace(1, 10, 10)
 inner_cv = KFold(n_splits=5, shuffle=False) # inner 5-fold cross-validation setup
@@ -111,9 +163,18 @@ for layer in layers:
     print(f"Elaborazione layer: {layer}")
     print(f"{'='*50}\n")
     if layer == 'text':
-        embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/text_embeds_gpt.pt")
-    else: 
+        # embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/text_embeds_gpt.pt")
+        embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/all_embedd/gpt2xl_token.pt")[:,24,:]
+        download_audio = False
+    if layer == 'audio':
+        embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/all_embedd/whisper_large.pt")[:,20,:,:]
+        # embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/audio_embeds_whis.pt")
+        download_audio = True
+        baseline_flag = True
+    else:
         embeddin_layer = torch.load(f"{base_path}/matteoc/podcast/audio_embeds_whis.pt")
+        download_audio = False
+        baseline_flag = False
 
     for subject in subjects:
         print(f"\n{'='*50}")
@@ -129,8 +190,9 @@ for layer in layers:
                             extension="fif")
         
         brain_data, feature_data = get_stimuli_and_feature(file_path, df, events, embeddin_layer, tmax=tmax, 
-                                                         pre_stimulus=pre_stimulus, post_audio=post_audio, pre_audio=pre_audio,
-                                                         ecog_sr_down=32, download_audio=False, baseline_flag=True)
+                                                         pre_stimulus=pre_stimulus, post_audio=post_audio, 
+                                                         pre_audio=pre_audio, ecog_sr_down=32, 
+                                                         download_audio=download_audio, baseline_flag=baseline_flag)
         
         epochs_data = brain_data.reshape(len(brain_data), -1)
         X = feature_data
@@ -142,6 +204,15 @@ for layer in layers:
         epochs_shape = brain_data.shape[1:]
         corrs_embedding, Y_preds, Y_test = train_encoding(X, Y)
         print(f"Encoding performance correlating matrix shape: {corrs_embedding.shape}")
+
+        # null_dist = generate_null_dist(n_perms=10000, dim_size=Y_preds.shape[0], seed=42)
+        # corrs_embedding_mean = corrs_embedding.mean(axis=0)
+        # max_corrs_ch = corrs_embedding_mean.max(axis=1)  # (channels,)
+        # max_corrs_tp = corrs_embedding_mean.max(axis=0)  # (timepoints,)
+        # p_values_ch = calculate_pvalues(max_corrs_ch[:, None], null_dist, alternative='greater')
+        # p_values_tp = calculate_pvalues(max_corrs_tp[:, None], null_dist, alternative='greater')
+        # significant_ch = multipletests(p_values_ch, alpha=.01, method='fdr_bh')[0]
+        # significant_tp = multipletests(p_values_tp, alpha=.01, method='fdr_bh')[0]
 
         Y_preds = Y_preds.reshape(-1, epochs_shape[0], epochs_shape[1])[0:1024]
         Y_test = Y_test.reshape(-1, epochs_shape[0], epochs_shape[1])[0:1024]
@@ -171,7 +242,7 @@ for layer in layers:
         p_values_tp = np.mean(null_distribution_tp >= real_corr_tp[None, :], axis=0)  
         p_values_ch = np.mean(null_distribution_ch >= real_corr_ch[None, :], axis=0)  
         significant_tp, pvals_corrected_tp = fdrcorrection(p_values_tp, alpha=0.02)
-        significant_ch, pvals_corrected_ch = fdrcorrection(p_values_ch, alpha=0.01)
+        significant_ch, pvals_corrected_ch = fdrcorrection(p_values_ch, alpha=0.02)
 
         raw = mne.io.read_raw_fif(file_path, verbose=False)
         raw.load_data(verbose=False)

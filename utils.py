@@ -221,6 +221,7 @@ def get_stimuli_and_feature(file_path, df, events, embedd_file, tmax=2.0, post_a
                           ecog_sr_down=32, download_audio=False, baseline_flag=False):
 
     raw = mne.io.read_raw_fif(file_path, verbose=False)
+    # raw = raw.pick("ecog", exclude="bads")
     raw.load_data()
     raw = raw.apply_function(func, channel_wise=True, verbose=False)
 
